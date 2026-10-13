@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
@@ -29,6 +31,13 @@ import re
 import subprocess
 import platform
 from .image_client import TripleRingBuffer, ZMQ_PublisherManager, ZMQ_Responser
+from .h264_tcp_stream import (
+    DEFAULT_CAMERA_NAME,
+    DEFAULT_HEIGHT,
+    DEFAULT_WIDTH,
+    H264TcpStreamServer,
+    compose_camera_output,
+)
 # webrtc dependencies
 import asyncio
 import json
@@ -41,8 +50,14 @@ import av
 import ssl
 from pathlib import Path
 import queue
+import selectors
+import socket
 import fractions
 from typing import Dict, Optional, Tuple, Any
+from aiortc.rtp import RtpPacket
+from aiortc.jitterbuffer import JitterBuffer
+from aiortc.codecs.h264 import H264Decoder, h264_depayload
+from av.video.reformatter import VideoReformatter
 
 # ========================================================
 # cam_config_server.yaml path
@@ -791,7 +806,7 @@ class CameraFinder:
         return None
 
     def _is_like_rgb(self, video_path):
-        cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(video_path, cv2.CAP_V4L2)
         if not cap.isOpened():
             return False
         ret, frame = cap.read()
@@ -920,10 +935,11 @@ class BaseCamera:
         self._enable_webrtc = enable_webrtc
         self._webrtc_port = webrtc_port
         self._webrtc_codec = webrtc_codec
-        if self._enable_webrtc:
-            self._webrtc_buffer = TripleRingBuffer()
+        self._enable_bgr_output = enable_webrtc
+        if self._enable_bgr_output:
+            self._bgr_buffer = TripleRingBuffer()
         else:
-            self._webrtc_buffer = None
+            self._bgr_buffer = None
 
     def __str__(self):
         raise NotImplementedError
@@ -945,12 +961,17 @@ class BaseCamera:
     def enable_zmq(self):
         return self._enable_zmq
 
+    def enable_bgr_output(self):
+        if not self._enable_bgr_output:
+            self._enable_bgr_output = True
+            self._bgr_buffer = TripleRingBuffer()
+
     def get_jpeg_bytes(self):
         jpeg_bytes = self._zmq_buffer.read() if self._enable_zmq and self._zmq_buffer else None
         return jpeg_bytes
 
     def get_bgr_frame(self):
-        bgr_numpy = self._webrtc_buffer.read() if self._enable_webrtc and self._webrtc_buffer else None
+        bgr_numpy = self._bgr_buffer.read() if self._enable_bgr_output and self._bgr_buffer else None
         return bgr_numpy
 
     def get_depth_frame(self):
@@ -1049,8 +1070,8 @@ class RealSenseCamera(BaseCamera):
 
         bgr_numpy = np.asanyarray(color_frame.get_data())
 
-        if self._enable_webrtc:
-            self._webrtc_buffer.write(bgr_numpy)
+        if self._enable_bgr_output:
+            self._bgr_buffer.write(bgr_numpy)
 
         if self._enable_zmq:
             ok, buf = cv2.imencode(".jpg", bgr_numpy)
@@ -1119,9 +1140,9 @@ class UVCCamera(BaseCamera):
                     if frame.jpeg_buffer is not None:
                         self._zmq_buffer.write(bytes(frame.jpeg_buffer))
 
-                if self._enable_webrtc:
+                if self._enable_bgr_output:
                     if frame.bgr is not None:
-                        self._webrtc_buffer.write(frame.bgr)
+                        self._bgr_buffer.write(frame.bgr)
 
                 if not self._ready.is_set():
                     self._ready.set()
@@ -1178,8 +1199,8 @@ class OpenCVCamera(BaseCamera):
         if self.cap is not None:
             ret, bgr_numpy = self.cap.read()
             if ret:
-                if self._enable_webrtc:
-                    self._webrtc_buffer.write(bgr_numpy)
+                if self._enable_bgr_output:
+                    self._bgr_buffer.write(bgr_numpy)
 
                 if self._enable_zmq:
                     ok, buf = cv2.imencode(".jpg", bgr_numpy)
@@ -1195,6 +1216,220 @@ class OpenCVCamera(BaseCamera):
         self.cap.release()
         self.cap = None
         logger_mp.info(f"[OpenCVCamera] Released {self._cam_topic}")
+
+class R1StereoCamera(BaseCamera):
+    """Receive R1's RTP H264 or JPEG eyes as one side-by-side head camera."""
+
+    def __init__(self, cam_topic, img_shape, fps,
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None,
+                 bind_host="0.0.0.0", source_host="192.168.123.161", left_port=5002, right_port=5003,
+                 receive_timeout=2.0, max_pair_delay=0.05, rtp_encoding="H264"):
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+        height, width = img_shape
+        if height <= 0 or width <= 0 or width % 2:
+            raise ValueError("R1 stereo image_shape requires a positive height and positive even width.")
+        if receive_timeout <= 0 or not 0 < max_pair_delay < receive_timeout:
+            raise ValueError("R1 stereo requires 0 < max_pair_delay < receive_timeout.")
+        if rtp_encoding not in ("H264", "JPEG"):
+            raise ValueError("R1 stereo rtp_encoding must be H264 or JPEG.")
+        self._rtp_encoding = rtp_encoding
+        self._source_host = source_host
+        self._receive_timeout = receive_timeout
+        self._max_pair_delay = max_pair_delay
+        self._selector = selectors.DefaultSelector()
+        self._sockets = []
+        self._jpeg_processes = []
+        self._receivers = []
+        self._closed = threading.Event()
+        self._last_pair_time = None
+        try:
+            for port in (left_port, right_port):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._sockets.append(sock)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                sock.bind((bind_host, port))
+                if rtp_encoding == "JPEG":
+                    # fdsrc preserves UDP datagram boundaries; the parent owns
+                    # binding/cleanup, including ephemeral ports used by tests.
+                    # Leave payload type unspecified: R1 firmware uses 26 or 96.
+                    process = subprocess.Popen(
+                        ["gst-launch-1.0", "-q", "fdsrc", f"fd={sock.fileno()}",
+                         "blocksize=65536", "do-timestamp=true", "!",
+                         "application/x-rtp,media=video,clock-rate=90000,encoding-name=JPEG",
+                         "!", "rtpjitterbuffer", "latency=20", "drop-on-latency=true",
+                         "!", "rtpjpegdepay", "!", "jpegparse",
+                         "!", "fdsink", "fd=1", "sync=false"],
+                        pass_fds=(sock.fileno(),), stdout=subprocess.PIPE,
+                    )
+                    self._jpeg_processes.append(process)
+                    os.set_blocking(process.stdout.fileno(), False)
+                    decoder = av.CodecContext.create("mjpeg", "r")
+                    decoder.thread_count = 1
+                    receiver = {
+                        "decoder": decoder, "pending": None, "latest": None,
+                    }
+                    self._receivers.append(receiver)
+                    self._selector.register(process.stdout, selectors.EVENT_READ, receiver)
+                    continue
+                sock.setblocking(False)
+                decoder = H264Decoder()
+                decoder.codec.thread_count = 1
+                receiver = {
+                    "jitter": JitterBuffer(capacity=128, is_video=True),
+                    "decoder": decoder,
+                    "reformatter": VideoReformatter(),
+                    "ssrc": None,
+                    "pending": None,
+                    "latest": None,
+                    "frame_times": {},
+                    "last_frame_time": None,
+                }
+                self._receivers.append(receiver)
+                self._selector.register(sock, selectors.EVENT_READ, receiver)
+        except Exception:
+            self.release()
+            raise
+        logger_mp.info(str(self))
+
+    def __str__(self):
+        ports = [sock.getsockname()[1] for sock in self._sockets]
+        return (f"[R1StereoCamera: {self._cam_topic}] RTP/{self._rtp_encoding} left/right ports={ports}, "
+                f"output={self._img_shape[1]}x{self._img_shape[0]} @ {self._fps} FPS")
+
+    def _update_frame(self):
+        if self._last_pair_time is None:
+            self._last_pair_time = time.monotonic()
+        while not self._closed.is_set():
+            remaining = self._receive_timeout - (time.monotonic() - self._last_pair_time)
+            if remaining <= 0:
+                self._last_pair_time = None
+                raise TimeoutError(f"R1 stereo {self._cam_topic} received no fresh pair for {self._receive_timeout}s")
+            try:
+                events = self._selector.select(min(remaining, 0.05))
+                for key, _ in events:
+                    receiver = key.data
+                    if self._rtp_encoding == "JPEG":
+                        data = os.read(key.fileobj.fileno(), 256 * 1024)
+                        if not data:
+                            if self._closed.is_set():
+                                return
+                            raise OSError("R1 RTP/JPEG receiver exited; inspect GStreamer stderr.")
+                        received_at = time.monotonic()
+                        for packet in receiver["decoder"].parse(data):
+                            bgr = cv2.imdecode(np.frombuffer(packet, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if bgr is not None:
+                                receiver["pending"] = (bgr, received_at)
+                                receiver["latest"] = (bgr, received_at)
+                        continue
+                    # Drain queued datagrams, keeping only the latest decoded eye.
+                    for _ in range(128):
+                        try:
+                            data, address = key.fileobj.recvfrom(65535)
+                        except BlockingIOError:
+                            break
+                        if address[0] != self._source_host:
+                            continue
+                        received_at = time.monotonic()
+                        try:
+                            packet = RtpPacket.parse(data)
+                            if packet.payload_type != 96:
+                                continue
+                            packet._data = h264_depayload(packet.payload)
+                        except ValueError:
+                            continue
+                        frame_times = receiver["frame_times"]
+                        last_frame_time = receiver["last_frame_time"]
+                        stalled = last_frame_time is not None and received_at - last_frame_time > max(0.25, 3.0 / self._fps)
+                        if receiver["ssrc"] != packet.ssrc or stalled:
+                            receiver["ssrc"] = packet.ssrc
+                            receiver["jitter"] = JitterBuffer(capacity=128, is_video=True)
+                            receiver["decoder"] = H264Decoder()
+                            receiver["decoder"].codec.thread_count = 1
+                            receiver["pending"] = None
+                            receiver["latest"] = None
+                            receiver["frame_times"].clear()
+                            receiver["last_frame_time"] = received_at
+                        # JitterBuffer emits a frame when the next timestamp arrives;
+                        # retain the original receipt time across gaps and reordering.
+                        frame_times.setdefault(packet.timestamp, received_at)
+                        if len(frame_times) > 128:
+                            del frame_times[next(iter(frame_times))]
+                        lost_frame, encoded = receiver["jitter"].add(packet)
+                        if lost_frame:
+                            receiver["decoder"] = H264Decoder()
+                            receiver["decoder"].codec.thread_count = 1
+                            receiver["pending"] = None
+                        if encoded is not None:
+                            receiver["last_frame_time"] = received_at
+                            frame_received_at = frame_times.pop(encoded.timestamp, None)
+                            if frame_received_at is None:
+                                continue
+                            for frame in receiver["decoder"].decode(encoded):
+                                bgr = receiver["reformatter"].reformat(frame, format="bgr24").to_ndarray()
+                                receiver["pending"] = (bgr, frame_received_at)
+                                receiver["latest"] = (bgr, frame_received_at)
+            except (OSError, ValueError):
+                if self._closed.is_set():
+                    return
+                raise
+
+            left, right = (receiver["pending"] for receiver in self._receivers)
+            if left is None or right is None:
+                continue
+            # Independent RTP clocks have different origins. This bounds reception
+            # skew for preview, rather than claiming synchronized exposure times.
+            if abs(left[1] - right[1]) > self._max_pair_delay:
+                self._receivers[0 if left[1] < right[1] else 1]["pending"] = None
+                continue
+            height, width = self._img_shape
+            eye_width = width // 2
+            output = np.zeros((height, width, 3), dtype=np.uint8)
+            for eye, (bgr, _) in enumerate((left, right)):
+                scale = min(eye_width / bgr.shape[1], height / bgr.shape[0])
+                resized_width = max(1, round(bgr.shape[1] * scale))
+                resized_height = max(1, round(bgr.shape[0] * scale))
+                resized = cv2.resize(bgr, (resized_width, resized_height))
+                x = eye * eye_width + (eye_width - resized_width) // 2
+                y = (height - resized_height) // 2
+                output[y:y + resized_height, x:x + resized_width] = resized
+            if self._enable_zmq:
+                ok, buf = cv2.imencode(".jpg", output)
+                if ok:
+                    self._zmq_buffer.write(buf.tobytes())
+            if self._enable_bgr_output:
+                self._bgr_buffer.write(output)
+            for receiver in self._receivers:
+                receiver["pending"] = None
+            self._last_pair_time = time.monotonic()
+            self._ready.set()
+            return
+
+    def get_eye_frames(self):
+        """Independent fresh eyes for App preview; paired outputs remain unchanged."""
+        now = time.monotonic()
+        frames = []
+        for receiver in self._receivers:
+            latest = receiver["latest"]
+            frames.append(latest[0] if latest is not None and now - latest[1] < self._receive_timeout else None)
+        return tuple(frames)
+
+    def release(self):
+        self._closed.set()
+        for process in self._jpeg_processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in self._jpeg_processes:
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+        for sock in self._sockets:
+            sock.close()
+        self._selector.close()
+        logger_mp.info(f"[R1StereoCamera] Released {self._cam_topic}")
+
 
 class IsaacSimCamera(BaseCamera):
     def __init__(self, cam_topic, img_shape, fps,
@@ -1262,11 +1497,9 @@ class IsaacSimCamera(BaseCamera):
                 else:
                     logger_mp.warning(f"[IsaacSimCamera] Failed to encode to JPEG for {self._cam_topic}")
 
-            # For WebRTC: use BGR frames directly
-            if self._enable_webrtc:
-                self._webrtc_buffer.write(frame_data)
-            else:
-                logger_mp.warning(f"[IsaacSimCamera] Failed to encode to WebRTC for {self._cam_topic}")
+            # WebRTC and the direct App stream both consume the latest BGR frame.
+            if self._enable_bgr_output:
+                self._bgr_buffer.write(frame_data)
             if not self._ready.is_set():
                 self._ready.set()
         else:
@@ -1285,12 +1518,40 @@ class ImageServer:
     def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False, isaacsim_enable=False):
         _apply_webrtc_config(cam_config)
         self._cam_config = cam_config
+        self._app_stream_config = (cam_config or {}).get("app_stream", {})
         self._realsense_enable = realsense_enable
         self._isaacsim_enable = isaacsim_enable
         self._stop_event = threading.Event()
         self._cameras: dict[str, BaseCamera] = {}
-        if not self._isaacsim_enable:
-            self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
+        self._app_stream = None
+        self._app_stream_topics = ()
+        self._app_stream_layout = self._app_stream_config.get("layout", "default")
+        self._camera_frame_times = {}
+        if self._app_stream_config.get("enabled", False):
+            self._app_stream_topics = tuple(
+                self._app_stream_config.get(
+                    "camera_topics",
+                    ("head_camera", "left_wrist_camera", "right_wrist_camera"),
+                )
+            )
+            if len(self._app_stream_topics) not in (1, 3):
+                raise ValueError(
+                    "app_stream.camera_topics must contain one camera or "
+                    "head, left wrist, and right wrist cameras."
+                )
+            if self._app_stream_layout not in ("default", "stereo_quad"):
+                raise ValueError(f"Unknown App stream layout: {self._app_stream_layout}")
+            if self._app_stream_layout == "stereo_quad" and len(self._app_stream_topics) != 3:
+                raise ValueError("stereo_quad camera_topics must contain head, left wrist, and right wrist.")
+            self._app_stream = H264TcpStreamServer(
+                control_host=self._app_stream_config.get("control_host", "0.0.0.0"),
+                control_port=self._app_stream_config.get("control_port", 13579),
+                camera_name=self._app_stream_config.get(
+                    "camera_name",
+                    DEFAULT_CAMERA_NAME,
+                ),
+            )
+        self._cam_finder = None
         self._responser = ZMQ_Responser(self._cam_config)
         self._zmq_publisher_manager = ZMQ_PublisherManager.get_instance()
         self._webrtc_publisher_manager = WebRTC_PublisherManager.get_instance()
@@ -1299,7 +1560,11 @@ class ImageServer:
         try:
             # Load cameras from self.cam_config
             for cam_topic, cam_cfg in self._cam_config.items():
-                if not cam_cfg.get("enable_zmq", False) and not cam_cfg.get("enable_webrtc", False):
+                if (
+                    not cam_cfg.get("enable_zmq", False)
+                    and not cam_cfg.get("enable_webrtc", False)
+                    and cam_topic not in self._app_stream_topics
+                ):
                     continue
 
                 enable_zmq = cam_cfg.get("enable_zmq", False)
@@ -1317,94 +1582,132 @@ class ImageServer:
                 physical_path = str(cam_cfg.get("physical_path")) if cam_cfg.get("physical_path") else None
                 serial_number = str(cam_cfg.get("serial_number")) if cam_cfg.get("serial_number") else None
 
-                if cam_type == "opencv":
-                    if physical_path is not None:
-                        vpath = self._cam_finder.get_vpath_by_ppath(physical_path)
-                        if vpath is None:
-                            self._cameras[cam_topic] = None
-                            logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with physical path {physical_path}")
-                        else:
-                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps, 
-                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                try:
+                    if cam_type in ("opencv", "realsense", "uvc") and self._cam_finder is None:
+                        self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
+
+                    if cam_type == "opencv":
+                        if physical_path is not None:
+                            vpath = self._cam_finder.get_vpath_by_ppath(physical_path)
+                            if vpath is None:
+                                self._cameras[cam_topic] = None
+                                logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with physical path {physical_path}")
+                            else:
+                                self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps,
+                                                                        enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                                continue
+
+                        if serial_number is not None:
+                            vpath = self._cam_finder.get_vpath_by_sn(serial_number)
+                            if vpath is None:
+                                self._cameras[cam_topic] = None
+                                logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with serial number {serial_number}")
+                            else:
+                                self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps,
+                                                                        enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            # once you specify either `physical_path` or `serial_number`, the system will no longer fall back to searching by `video_id`.
+                            # ——— even if no camera matches the given path/serial.
                             continue
 
-                    if serial_number is not None:
-                        vpath = self._cam_finder.get_vpath_by_sn(serial_number)
-                        if vpath is None:
+                        if not self._cam_finder.is_vpath_exist(video_path):
                             self._cameras[cam_topic] = None
-                            logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with serial number {serial_number}")
+                            logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with video_id {video_id}")
                         else:
-                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps, 
+                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, video_path, img_shape, fps,
                                                                     enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
-                        # once you specify either `physical_path` or `serial_number`, the system will no longer fall back to searching by `video_id`.
-                        # ——— even if no camera matches the given path/serial.
-                        continue
-                    
-                    if not self._cam_finder.is_vpath_exist(video_path):
-                        self._cameras[cam_topic] = None
-                        logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with video_id {video_id}")
-                    else:
-                        self._cameras[cam_topic] = OpenCVCamera(cam_topic, video_path, img_shape, fps,
-                                                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
                         
 
-                elif cam_type == "realsense":
-                    if not self._realsense_enable:
-                        self._cameras[cam_topic] = None
-                        logger_mp.error(f"[Image Server] Please start image server with the '--rs' flag to support Realsense {cam_topic}.")
-                    elif not self._cam_finder.is_rs_serial_exist(serial_number):
-                        self._cameras[cam_topic] = None
-                        logger_mp.error(f"[Image Server] Cannot find RealSenseCamera for {cam_topic}")
-                    else:
-                        self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
-                                                                   enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
-
-                elif cam_type == "uvc":
-                    uid = None
-                    if physical_path is not None:
-                        uid = self._cam_finder.get_uid_by_ppath(physical_path)
-                        if uid is None:
+                    elif cam_type == "realsense":
+                        if not self._realsense_enable:
                             self._cameras[cam_topic] = None
-                            logger_mp.error(f"[Image Server] Cannot find UVCCamera for {cam_topic} with physical path {physical_path}")
+                            logger_mp.error(f"[Image Server] Please start image server with the '--rs' flag to support Realsense {cam_topic}.")
+                        elif not self._cam_finder.is_rs_serial_exist(serial_number):
+                            self._cameras[cam_topic] = None
+                            logger_mp.error(f"[Image Server] Cannot find RealSenseCamera for {cam_topic}")
                         else:
-                            self._cameras[cam_topic] = UVCCamera(cam_topic, uid, img_shape, fps, 
-                                                                 enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
+                                                                       enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+
+                    elif cam_type == "uvc":
+                        uid = None
+                        if physical_path is not None:
+                            uid = self._cam_finder.get_uid_by_ppath(physical_path)
+                            if uid is None:
+                                self._cameras[cam_topic] = None
+                                logger_mp.error(f"[Image Server] Cannot find UVCCamera for {cam_topic} with physical path {physical_path}")
+                            else:
+                                self._cameras[cam_topic] = UVCCamera(cam_topic, uid, img_shape, fps,
+                                                                     enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                                continue
+
+                        if serial_number is not None:
+                            uid = self._cam_finder.get_uid_by_sn(serial_number)
+                            if uid is None:
+                                self._cameras[cam_topic] = None
+                                logger_mp.error(f"[Image Server] Cannot find UVCCamera for {cam_topic} with serial number {serial_number}")
+                            else:
+                                self._cameras[cam_topic] = UVCCamera(cam_topic, uid, img_shape, fps,
+                                                                     enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            # once you specify either `physical_path` or `serial_number`, the system will no longer fall back to searching by `video_id`.
+                            # ——— even if no camera matches the given path/serial.
                             continue
+                    elif cam_type == "r1_stereo":
+                        self._cameras[cam_topic] = R1StereoCamera(
+                            cam_topic, img_shape, fps,
+                            enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                            bind_host=cam_cfg.get("bind_host", "0.0.0.0"),
+                            source_host=cam_cfg.get("source_host", "192.168.123.161"),
+                            left_port=cam_cfg.get("left_port", 5002),
+                            right_port=cam_cfg.get("right_port", 5003),
+                            receive_timeout=cam_cfg.get("receive_timeout", 2.0),
+                            max_pair_delay=cam_cfg.get("max_pair_delay", 0.05),
+                            rtp_encoding=cam_cfg.get("rtp_encoding", "H264"),
+                        )
+                    elif cam_type == "isaacsim":
+                        # Check if binocular mode is enabled
+                        binocular = cam_cfg.get("binocular", False)
 
-                    if serial_number is not None:
-                        uid = self._cam_finder.get_uid_by_sn(serial_number)
-                        if uid is None:
-                            self._cameras[cam_topic] = None
-                            logger_mp.error(f"[Image Server] Cannot find UVCCamera for {cam_topic} with serial number {serial_number}")
+                        # For IsaacSim cameras, determine image source based on camera topic and binocular setting
+                        if binocular:
+                            # Binocular cameras (like head) need to read left+right and concatenate
+                            image_source = "head"  # Special marker for binocular
                         else:
-                            self._cameras[cam_topic] = UVCCamera(cam_topic, uid, img_shape, fps, 
-                                                                 enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
-                        # once you specify either `physical_path` or `serial_number`, the system will no longer fall back to searching by `video_id`.
-                        # ——— even if no camera matches the given path/serial.
-                        continue
-                elif cam_type == "isaacsim":
-                    # Check if binocular mode is enabled
-                    binocular = cam_cfg.get("binocular", False)
+                            # Monocular cameras read their specific source
+                            if "left" in cam_topic.lower():
+                                image_source = "left"
+                            elif "right" in cam_topic.lower():
+                                image_source = "right"
+                            else:
+                                image_source = "head"  # fallback
 
-                    # For IsaacSim cameras, determine image source based on camera topic and binocular setting
-                    if binocular:
-                        # Binocular cameras (like head) need to read left+right and concatenate
-                        image_source = "head"  # Special marker for binocular
+                        self._cameras[cam_topic] = IsaacSimCamera(cam_topic, img_shape, fps,
+                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                                                    image_source=image_source, binocular=binocular)
                     else:
-                        # Monocular cameras read their specific source
-                        if "left" in cam_topic.lower():
-                            image_source = "left"
-                        elif "right" in cam_topic.lower():
-                            image_source = "right"
-                        else:
-                            image_source = "head"  # fallback
+                        logger_mp.error(f"[Image Server] Unknown camera type {cam_type} for {cam_topic}, skipping...")
+                        continue
+                except Exception as exc:
+                    if self._app_stream_layout != "stereo_quad" or cam_topic not in self._app_stream_topics:
+                        raise
+                    self._cameras[cam_topic] = None
+                    logger_mp.warning(f"[App Stream] {cam_topic} initialization failed: {exc}; using nocarema tile.")
 
-                    self._cameras[cam_topic] = IsaacSimCamera(cam_topic, img_shape, fps,
-                                                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
-                                                                image_source=image_source, binocular=binocular)
-                else:
-                    logger_mp.error(f"[Image Server] Unknown camera type {cam_type} for {cam_topic}, skipping...")
-                    continue
+            if (
+                self._cam_config.get("head_camera", {}).get("enable_zmq", False)
+                and self._cameras.get("head_camera") is None
+            ):
+                raise RuntimeError("Required ZMQ head_camera failed to initialize.")
+
+            for camera_topic in self._app_stream_topics:
+                camera = self._cameras.get(camera_topic)
+                if camera is None:
+                    if self._app_stream_layout == "stereo_quad":
+                        logger_mp.warning(f"[App Stream] {camera_topic} unavailable; using nocarema tile.")
+                        continue
+                    raise ValueError(
+                        f"App stream camera topic {camera_topic!r} is not available."
+                    )
+                camera.enable_bgr_output()
         except Exception as e:
             logger_mp.error(f"[Image Server] Initialization failed: {e}")
             self._clean_up()
@@ -1419,8 +1722,14 @@ class ImageServer:
             while not self._stop_event.is_set():
                 try:
                     camera._update_frame()
+                    self._camera_frame_times[cam_topic] = time.monotonic()
                 except Exception as e:
-                    logger_mp.error(f"[Image Server] Error updating frame for {cam_topic} camera")
+                    logger_mp.error(f"[Image Server] Error updating frame for {cam_topic} camera: {e}")
+                    if self._app_stream_layout == "stereo_quad" and cam_topic in self._app_stream_topics:
+                        self._camera_frame_times.pop(cam_topic, None)
+                        if isinstance(camera, R1StereoCamera) and isinstance(e, TimeoutError):
+                            continue
+                        break
                     self._stop_event.set()
                     break
                 next_frame_time += interval
@@ -1431,7 +1740,8 @@ class ImageServer:
                     next_frame_time = time.monotonic()
         except Exception as e:
             logger_mp.error(f"[Image Server] Failed to update frames for {cam_topic} camera: {e}")
-            self._stop_event.set()
+            if self._app_stream_layout != "stereo_quad" or cam_topic not in self._app_stream_topics:
+                self._stop_event.set()
 
     def _zmq_pub(self, cam_topic: str, camera: BaseCamera):
         try:
@@ -1439,11 +1749,18 @@ class ImageServer:
             next_frame_time = time.monotonic()
 
             while not self._stop_event.is_set():
+                if self._app_stream_layout == "stereo_quad" and cam_topic in self._app_stream_topics:
+                    if time.monotonic() - self._camera_frame_times.get(cam_topic, float("-inf")) >= 2.0:
+                        self._stop_event.wait(interval)
+                        continue
                 jpeg_bytes = camera.get_jpeg_bytes()
                 if jpeg_bytes is not None:
                     self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
                 else:
                     logger_mp.warning(f"[Image Server] {cam_topic} returned no frame.")
+                    if self._app_stream_layout == "stereo_quad" and cam_topic in self._app_stream_topics:
+                        self._stop_event.wait(interval)
+                        continue
                     self._stop_event.set()
                     break
 
@@ -1455,7 +1772,8 @@ class ImageServer:
                     next_frame_time = time.monotonic()
         except Exception as e:
             logger_mp.error(f"[Image Server] Failed to publish zmq frame from {cam_topic} camera.")
-            self._stop_event.set()
+            if self._app_stream_layout != "stereo_quad" or cam_topic not in self._app_stream_topics:
+                self._stop_event.set()
     
     def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
         try:
@@ -1463,12 +1781,19 @@ class ImageServer:
             webrtc_codec = camera.get_webrtc_codec()
             next_frame_time = time.monotonic()
             while not self._stop_event.is_set():
+                if self._app_stream_layout == "stereo_quad" and cam_topic in self._app_stream_topics:
+                    if time.monotonic() - self._camera_frame_times.get(cam_topic, float("-inf")) >= 2.0:
+                        self._stop_event.wait(interval)
+                        continue
                 bgr_frame = camera.get_bgr_frame()
 
                 if bgr_frame is not None:
                     self._webrtc_publisher_manager.publish(bgr_frame, camera.get_webrtc_port(), codec_pref=webrtc_codec)
                 else:
                     logger_mp.info(f"[Image Server] {cam_topic} returned no frame.")
+                    if self._app_stream_layout == "stereo_quad" and cam_topic in self._app_stream_topics:
+                        self._stop_event.wait(interval)
+                        continue
                     self._stop_event.set()
                     break
 
@@ -1480,9 +1805,54 @@ class ImageServer:
                     next_frame_time = time.monotonic()
         except Exception as e:
             logger_mp.error(f"[Image Server] Failed to publish rtc frame from {cam_topic} camera.")
-            self._stop_event.set()
+            if self._app_stream_layout != "stereo_quad" or cam_topic not in self._app_stream_topics:
+                self._stop_event.set()
+
+    def _app_stream_pub(self):
+        width = int(self._app_stream_config.get("width", DEFAULT_WIDTH))
+        height = int(self._app_stream_config.get("height", DEFAULT_HEIGHT))
+
+        while not self._stop_event.is_set():
+            if not self._app_stream.stream_requested:
+                self._stop_event.wait(0.1)
+                continue
+            if not self._app_stream.frame_due():
+                self._stop_event.wait(0.005)
+                continue
+
+            frames = []
+            for index, camera_topic in enumerate(self._app_stream_topics):
+                camera = self._cameras.get(camera_topic)
+                if self._app_stream_layout == "stereo_quad" and index == 0 and isinstance(camera, R1StereoCamera):
+                    frames.extend(camera.get_eye_frames())
+                    continue
+                frame = camera.get_bgr_frame() if camera is not None else None
+                if self._app_stream_layout == "stereo_quad":
+                    if time.monotonic() - self._camera_frame_times.get(camera_topic, float("-inf")) >= 2.0:
+                        frame = None
+                    if index == 0:
+                        frames.extend((None, None) if frame is None else np.hsplit(frame, 2))
+                        continue
+                frames.append(frame)
+            if self._app_stream_layout == "default" and any(frame is None for frame in frames):
+                self._stop_event.wait(0.01)
+                continue
+
+            try:
+                output = compose_camera_output(
+                    frames,
+                    width=width,
+                    height=height,
+                    layout=self._app_stream_layout,
+                )
+                self._app_stream.send_frame(output)
+            except Exception as exc:
+                logger_mp.warning(f"[App Stream] Failed to publish frame: {exc}")
+                self._stop_event.wait(0.1)
 
     def _clean_up(self):
+        if self._app_stream is not None:
+            self._app_stream.stop()
         self._responser.stop()
         for t in self._publisher_threads:
             if t.is_alive():
@@ -1512,6 +1882,8 @@ class ImageServer:
     def start(self):
         for camera_topic, camera in self._cameras.items():
             if camera is None:
+                if self._app_stream_layout == "stereo_quad" and camera_topic in self._app_stream_topics:
+                    continue
                 logger_mp.error(f"[Image Server] Camera {camera_topic} failed to initialize previously, cannot start.")
                 self._stop_event.set()
                 self._clean_up()
@@ -1523,6 +1895,8 @@ class ImageServer:
             time.sleep(2.0)  # wait a bit for IsaacSim shared memory to be ready
 
         for camera_topic, camera in self._cameras.items():
+            if self._app_stream_layout == "stereo_quad" and camera_topic in self._app_stream_topics:
+                continue
             # Use longer timeout for IsaacSim cameras since they need to wait for shared memory data
             if self._isaacsim_enable:
                 timeout = 15.0
@@ -1534,8 +1908,16 @@ class ImageServer:
                 self._stop_event.set()
                 self._clean_up()
             logger_mp.info(f"[Image Server] {camera_topic} is ready.")
+
+        if self._app_stream is not None:
+            self._app_stream.start()
+            t = threading.Thread(target=self._app_stream_pub, daemon=True)
+            t.start()
+            self._publisher_threads.append(t)
         
         for camera_topic, camera in self._cameras.items():
+            if camera is None:
+                continue
             if camera.enable_webrtc():
                 t = threading.Thread(target=self._webrtc_pub, args=(camera_topic, camera), daemon=True)
                 t.start()

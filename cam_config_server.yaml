@@ -11,19 +11,31 @@ webrtc:
   gop_length: 60      # frames between keyframes; lower = faster recovery from packet loss
 
 # =====================================================
+# Robotree App direct stream
+# =====================================================
+app_stream:
+  enabled: true
+  control_host: 0.0.0.0
+  control_port: 13579
+  camera_name: ROBOT_CAMERAS
+  camera_topics: [head_camera, left_wrist_camera, right_wrist_camera]
+  width: 1280
+  height: 1080
+
+# =====================================================
 # Head camera configuration
 # =====================================================
 # camera topic
 head_camera:
   # camera config
 
-  # if enable_zmq and enable_webrtc are both false, the camera will not start
+  # if ZMQ, WebRTC, and app_stream are all disabled, the camera will not start
   # Set to true to enable ZMQ publishing, false to disable
   enable_zmq: true
   # Port to publish camera stream, e.g. zmq tcp://*:55555.  image_client.py should connect to the same port
   zmq_port : 55555
   # Set to true to enable WebRTC publishing, false to disable
-  enable_webrtc: true
+  enable_webrtc: false
   # Port for WebRTC signaling server
   webrtc_port : 60001
   # webrtc codec preference, options: "vp8", "h264"
@@ -65,7 +77,7 @@ head_camera:
 left_wrist_camera:
   enable_zmq: true
   zmq_port : 55556
-  enable_webrtc: true
+  enable_webrtc: false
   webrtc_port : 60002
   webrtc_codec: h264
   type: uvc
@@ -82,7 +94,7 @@ left_wrist_camera:
 right_wrist_camera:
   enable_zmq: true
   zmq_port : 55557
-  enable_webrtc: true
+  enable_webrtc: false
   webrtc_port: 60003
   webrtc_codec: h264
   type: uvc
